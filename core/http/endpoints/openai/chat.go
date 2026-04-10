@@ -84,14 +84,20 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 		_, _, _, err := ComputeChoices(req, s, config, cl, startupOptions, loader, func(s string, c *[]schema.Choice) {}, func(s string, tokenUsage backend.TokenUsage) bool {
 			var reasoningDelta, contentDelta string
 
-			// Prefer pre-parsed chat deltas from C++ autoparser when available
+			// Always keep the Go-side extractor in sync with raw tokens so it
+			// can serve as fallback for backends without an autoparser (e.g. vLLM).
+			goReasoning, goContent := extractor.ProcessToken(s)
+
+			// When C++ autoparser chat deltas are available, prefer them — they
+			// handle model-specific formats (Gemma 4, etc.) without Go-side tags.
+			// Otherwise fall back to Go-side extraction.
 			if tokenUsage.HasChatDeltaContent() {
-				reasoningDelta, contentDelta = tokenUsage.ChatDeltaReasoningAndContent()
-				// Keep extractor state consistent for fallback
-				extractor.ProcessToken(s)
+				rawReasoning, cd := tokenUsage.ChatDeltaReasoningAndContent()
+				contentDelta = cd
+				reasoningDelta = extractor.ProcessChatDeltaReasoning(rawReasoning)
 			} else {
-				// Fallback: Go-side extraction from raw text
-				reasoningDelta, contentDelta = extractor.ProcessToken(s)
+				reasoningDelta = goReasoning
+				contentDelta = goContent
 			}
 
 			usage := schema.OpenAIUsage{
@@ -141,20 +147,34 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 		result := ""
 		lastEmittedCount := 0
 		sentInitialRole := false
+		hasChatDeltaToolCalls := false
+		hasChatDeltaContent := false
 
 		_, tokenUsage, chatDeltas, err := ComputeChoices(req, prompt, config, cl, startupOptions, loader, func(s string, c *[]schema.Choice) {}, func(s string, usage backend.TokenUsage) bool {
 			result += s
 
+			// Track whether ChatDeltas from the C++ autoparser contain
+			// tool calls or content, so the retry decision can account for them.
+			for _, d := range usage.ChatDeltas {
+				if len(d.ToolCalls) > 0 {
+					hasChatDeltaToolCalls = true
+				}
+				if d.Content != "" {
+					hasChatDeltaContent = true
+				}
+			}
+
 			var reasoningDelta, contentDelta string
 
-			// Prefer pre-parsed chat deltas from C++ autoparser when available
+			goReasoning, goContent := extractor.ProcessToken(s)
+
 			if usage.HasChatDeltaContent() {
-				reasoningDelta, contentDelta = usage.ChatDeltaReasoningAndContent()
-				// Keep extractor state consistent for fallback
-				extractor.ProcessToken(s)
+				rawReasoning, cd := usage.ChatDeltaReasoningAndContent()
+				contentDelta = cd
+				reasoningDelta = extractor.ProcessChatDeltaReasoning(rawReasoning)
 			} else {
-				// Fallback: Go-side extraction from raw text
-				reasoningDelta, contentDelta = extractor.ProcessToken(s)
+				reasoningDelta = goReasoning
+				contentDelta = goContent
 			}
 
 			// Emit reasoning deltas in their own SSE chunks before any tool-call chunks
@@ -245,55 +265,52 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					lastEmittedCount = len(partialResults)
 				}
 			} else {
-				// Try JSON tool call parsing for streaming
-				// Check if the result looks like JSON tool calls
+				// Try JSON tool call parsing for streaming.
+				// Only emit NEW tool calls (same guard as XML parser above).
 				jsonResults, jsonErr := functions.ParseJSONIterative(cleanedResult, true)
-				if jsonErr == nil && len(jsonResults) > 0 {
-					// Check if these are tool calls (have "name" and optionally "arguments")
-					for _, jsonObj := range jsonResults {
-						if name, ok := jsonObj["name"].(string); ok && name != "" {
-							// This looks like a tool call
-							args := "{}"
-							if argsVal, ok := jsonObj["arguments"]; ok {
-								if argsStr, ok := argsVal.(string); ok {
-									args = argsStr
-								} else {
-									argsBytes, _ := json.Marshal(argsVal)
-									args = string(argsBytes)
-								}
+				if jsonErr == nil && len(jsonResults) > lastEmittedCount {
+					for i := lastEmittedCount; i < len(jsonResults); i++ {
+						jsonObj := jsonResults[i]
+						name, ok := jsonObj["name"].(string)
+						if !ok || name == "" {
+							continue
+						}
+						args := "{}"
+						if argsVal, ok := jsonObj["arguments"]; ok {
+							if argsStr, ok := argsVal.(string); ok {
+								args = argsStr
+							} else {
+								argsBytes, _ := json.Marshal(argsVal)
+								args = string(argsBytes)
 							}
-							// Emit tool call
-							initialMessage := schema.OpenAIResponse{
-								ID:      id,
-								Created: created,
-								Model:   req.Model,
-								Choices: []schema.Choice{{
-									Delta: &schema.Message{
-										Role: "assistant",
-										ToolCalls: []schema.ToolCall{
-											{
-												Index: lastEmittedCount,
-												ID:    id,
-												Type:  "function",
-												FunctionCall: schema.FunctionCall{
-													Name:      name,
-													Arguments: args,
-												},
+						}
+						initialMessage := schema.OpenAIResponse{
+							ID:      id,
+							Created: created,
+							Model:   req.Model,
+							Choices: []schema.Choice{{
+								Delta: &schema.Message{
+									Role: "assistant",
+									ToolCalls: []schema.ToolCall{
+										{
+											Index: i,
+											ID:    id,
+											Type:  "function",
+											FunctionCall: schema.FunctionCall{
+												Name:      name,
+												Arguments: args,
 											},
 										},
 									},
-									Index:        0,
-									FinishReason: nil,
-								}},
-								Object: "chat.completion.chunk",
-							}
-							select {
-							case responses <- initialMessage:
-							default:
-							}
-							lastEmittedCount++
+								},
+								Index:        0,
+								FinishReason: nil,
+							}},
+							Object: "chat.completion.chunk",
 						}
+						responses <- initialMessage
 					}
+					lastEmittedCount = len(jsonResults)
 				}
 			}
 			return true
@@ -302,15 +319,22 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 				// After streaming completes: check if we got actionable content
 				cleaned := extractor.CleanedContent()
 				// Check for tool calls from chat deltas (will be re-checked after ComputeChoices,
-				// but we need to know here whether to retry)
-				hasToolCalls := lastEmittedCount > 0
-				if cleaned == "" && !hasToolCalls {
+				// but we need to know here whether to retry).
+				// Also check ChatDelta flags — when the C++ autoparser is active,
+				// tool calls and content are delivered via ChatDeltas while the
+				// raw message is cleared. Without this check, we'd retry
+				// unnecessarily, losing valid results and concatenating output.
+				hasToolCalls := lastEmittedCount > 0 || hasChatDeltaToolCalls
+				hasContent := cleaned != "" || hasChatDeltaContent
+				if !hasContent && !hasToolCalls {
 					xlog.Warn("Streaming: backend produced only reasoning, retrying",
 						"reasoning_len", len(extractor.Reasoning()), "attempt", attempt+1)
 					extractor.ResetAndSuppressReasoning()
 					result = ""
 					lastEmittedCount = 0
 					sentInitialRole = false
+					hasChatDeltaToolCalls = false
+					hasChatDeltaContent = false
 					return true
 				}
 				return false
@@ -399,10 +423,17 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					toolCallID = id
 				}
 
+				if i < lastEmittedCount {
+					// Already emitted during streaming by the incremental
+					// JSON/XML parser — skip to avoid duplicate tool calls.
+					continue
+				}
+
+				// Tool call not yet emitted — send name + args (two chunks).
 				initialMessage := schema.OpenAIResponse{
 					ID:      id,
 					Created: created,
-					Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
+					Model:   req.Model,
 					Choices: []schema.Choice{{
 						Delta: &schema.Message{
 							Role: "assistant",
@@ -427,7 +458,7 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 				responses <- schema.OpenAIResponse{
 					ID:      id,
 					Created: created,
-					Model:   req.Model, // we have to return what the user sent here, due to OpenAI spec.
+					Model:   req.Model,
 					Choices: []schema.Choice{{
 						Delta: &schema.Message{
 							Role:    "assistant",
@@ -985,6 +1016,29 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 					return err
 				}
 
+				// For non-tool requests: prefer C++ autoparser chat deltas over
+				// Go-side tag extraction (which can mangle output when thinkingStartToken
+				// differs from the model's actual reasoning tags, e.g. Gemma 4).
+				if !shouldUseFn && len(chatDeltas) > 0 {
+					deltaContent := functions.ContentFromChatDeltas(chatDeltas)
+					deltaReasoning := functions.ReasoningFromChatDeltas(chatDeltas)
+					if deltaContent != "" || deltaReasoning != "" {
+						xlog.Debug("[ChatDeltas] non-SSE no-tools: overriding result with C++ autoparser deltas",
+							"content_len", len(deltaContent), "reasoning_len", len(deltaReasoning))
+						stopReason := FinishReasonStop
+						message := &schema.Message{Role: "assistant", Content: &deltaContent}
+						if deltaReasoning != "" {
+							message.Reasoning = &deltaReasoning
+						}
+						newChoice := schema.Choice{FinishReason: &stopReason, Index: 0, Message: message}
+						// Preserve logprobs from the original result
+						if len(result) > 0 && result[0].Logprobs != nil {
+							newChoice.Logprobs = result[0].Logprobs
+						}
+						result = []schema.Choice{newChoice}
+					}
+				}
+
 				// Tool parsing is deferred here (only when shouldUseFn) so chat deltas are available
 				if shouldUseFn {
 					var funcResults []functions.FuncCallResults
@@ -994,6 +1048,13 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 						xlog.Debug("[ChatDeltas] non-SSE: using C++ autoparser tool calls, skipping Go-side parsing", "count", len(deltaToolCalls))
 						funcResults = deltaToolCalls
 						textContentToReturn = functions.ContentFromChatDeltas(chatDeltas)
+						cbReasoning = functions.ReasoningFromChatDeltas(chatDeltas)
+					} else if deltaContent := functions.ContentFromChatDeltas(chatDeltas); len(chatDeltas) > 0 && deltaContent != "" {
+						// ChatDeltas have content but no tool calls — model answered without using tools.
+						// This happens with thinking models (e.g. Gemma 4) where the Go-side reasoning
+						// extraction misclassifies clean content as reasoning, leaving cbRawResult empty.
+						xlog.Debug("[ChatDeltas] non-SSE: using C++ autoparser content (no tool calls)", "content_len", len(deltaContent))
+						textContentToReturn = deltaContent
 						cbReasoning = functions.ReasoningFromChatDeltas(chatDeltas)
 					} else {
 						// Fallback: parse tool calls from raw text
@@ -1017,7 +1078,13 @@ func ChatEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator
 
 					switch {
 					case noActionsToRun:
-						qResult, qErr := handleQuestion(config, funcResults, cbRawResult, predInput)
+						// Use textContentToReturn if available (e.g. from ChatDeltas),
+						// otherwise fall back to cbRawResult for legacy Go-side parsing.
+						questionInput := cbRawResult
+						if textContentToReturn != "" {
+							questionInput = textContentToReturn
+						}
+						qResult, qErr := handleQuestion(config, funcResults, questionInput, predInput)
 						if qErr != nil {
 							xlog.Error("error handling question", "error", qErr)
 						}

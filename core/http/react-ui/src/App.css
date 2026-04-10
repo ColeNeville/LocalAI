@@ -904,38 +904,15 @@
   box-shadow: 0 0 0 2px var(--color-primary-light);
 }
 
-/* Code editor (syntax-highlighted textarea overlay) */
-.code-editor-highlight .hljs {
-  background: transparent;
-  padding: 0;
+/* CodeMirror editor wrapper */
+.code-editor-cm .cm-editor {
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-md);
 }
-.code-editor-wrapper textarea:focus {
+.code-editor-cm .cm-editor.cm-focused {
   border-color: var(--color-border-strong);
+  outline: none;
 }
-
-/* highlight.js YAML syntax colours – dark theme */
-[data-theme="dark"] .hljs-attr { color: #7dd3fc; }
-[data-theme="dark"] .hljs-string { color: #6ee7b7; }
-[data-theme="dark"] .hljs-number { color: #fcd34d; }
-[data-theme="dark"] .hljs-literal { color: #f9a8d4; }
-[data-theme="dark"] .hljs-keyword { color: #c4b5fd; }
-[data-theme="dark"] .hljs-comment { color: #64748b; font-style: italic; }
-[data-theme="dark"] .hljs-meta { color: #94a3b8; }
-[data-theme="dark"] .hljs-bullet { color: #38bdf8; }
-[data-theme="dark"] .hljs-section { color: #a78bfa; font-weight: 600; }
-[data-theme="dark"] .hljs-type { color: #f472b6; }
-
-/* highlight.js YAML syntax colours – light theme */
-[data-theme="light"] .hljs-attr { color: #0369a1; }
-[data-theme="light"] .hljs-string { color: #15803d; }
-[data-theme="light"] .hljs-number { color: #b45309; }
-[data-theme="light"] .hljs-literal { color: #be185d; }
-[data-theme="light"] .hljs-keyword { color: #7c3aed; }
-[data-theme="light"] .hljs-comment { color: #94a3b8; font-style: italic; }
-[data-theme="light"] .hljs-meta { color: #64748b; }
-[data-theme="light"] .hljs-bullet { color: #0284c7; }
-[data-theme="light"] .hljs-section { color: #6d28d9; font-weight: 600; }
-[data-theme="light"] .hljs-type { color: #db2777; }
 
 /* Form groups */
 .form-group {
@@ -1957,6 +1934,56 @@
 @keyframes thinkingBounce {
   0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
   40% { transform: scale(1); opacity: 1; }
+}
+
+/* Staging progress indicator (replaces thinking dots during model transfer) */
+.chat-staging-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 200px;
+  max-width: 320px;
+}
+.chat-staging-label {
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.chat-staging-label i {
+  color: var(--color-primary);
+}
+.chat-staging-detail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-staging-bar-container {
+  flex: 1;
+  height: 4px;
+  background: var(--color-bg-tertiary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.chat-staging-bar {
+  height: 100%;
+  background: var(--color-primary);
+  border-radius: 2px;
+  transition: width 300ms ease;
+}
+.chat-staging-pct {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  min-width: 32px;
+  text-align: right;
+}
+.chat-staging-file {
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Message completion flash */
