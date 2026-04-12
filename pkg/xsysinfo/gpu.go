@@ -32,6 +32,7 @@ var UnifiedMemoryDevices = []string{
 	"GB10",
 	"NVIDIA Thor",
 	"Thor",
+	"AMD Strix Halo",
 }
 
 // GPUMemoryInfo contains real-time GPU memory usage information
@@ -133,6 +134,42 @@ func HasGPU(vendor string) bool {
 			return true
 		}
 	}
+	return false
+}
+
+// isAMDAPUDevice checks if the system has a Strix Halo APU
+// Currently limited to Strix Halo; can be expanded later if needed
+func isAMDAPUDevice() bool {
+	entries, err := os.ReadDir("/sys/class/drm")
+	if err != nil {
+		return false
+	}
+
+	targetPatterns := []string{
+		"strix halo",
+	}
+
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "card") {
+			continue
+		}
+
+		namePath := "/sys/class/drm/" + entry.Name() + "/device/name"
+		data, err := os.ReadFile(namePath)
+		if err != nil {
+			continue
+		}
+
+		name := strings.TrimSpace(strings.ToLower(string(data)))
+
+		for _, pattern := range targetPatterns {
+			if strings.Contains(name, pattern) {
+				xlog.Debug("Strix Halo APU detected", "device", entry.Name(), "name", name)
+				return true
+			}
+		}
+	}
+
 	return false
 }
 
@@ -483,6 +520,59 @@ func getAMDGPUMemory() []GPUMemoryInfo {
 		if totalBytes < 1000000 {
 			usedBytes *= 1024 * 1024
 			totalBytes *= 1024 * 1024
+		}
+
+		if isAMDAPUDevice() && totalBytes < 2048*1024*1024 {
+			xlog.Debug("Strix Halo APU detected with rocm-smi under-reporting, falling back to system RAM",
+				"reported_total_mb", totalBytes/(1024*1024))
+
+			sysInfo, err := GetSystemRAMInfo()
+			if err != nil {
+				xlog.Debug("failed to get system RAM for Strix Halo APU", "error", err)
+				freeBytes := uint64(0)
+				if totalBytes > usedBytes {
+					freeBytes = totalBytes - usedBytes
+				}
+
+				usagePercent := 0.0
+				if totalBytes > 0 {
+					usagePercent = float64(usedBytes) / float64(totalBytes) * 100
+				}
+
+				gpus = append(gpus, GPUMemoryInfo{
+					Index:        idx,
+					Name:         "AMD GPU",
+					Vendor:       VendorAMD,
+					TotalVRAM:    totalBytes,
+					UsedVRAM:     usedBytes,
+					FreeVRAM:     freeBytes,
+					UsagePercent: usagePercent,
+				})
+				continue
+			}
+
+			totalBytes = sysInfo.Total
+			usedBytes = sysInfo.Used
+			freeBytes := uint64(0)
+			if totalBytes > usedBytes {
+				freeBytes = totalBytes - usedBytes
+			}
+
+			usagePercent := 0.0
+			if totalBytes > 0 {
+				usagePercent = float64(usedBytes) / float64(totalBytes) * 100
+			}
+
+			gpus = append(gpus, GPUMemoryInfo{
+				Index:        idx,
+				Name:         "AMD Strix Halo (Unified Memory)",
+				Vendor:       VendorAMD,
+				TotalVRAM:    totalBytes,
+				UsedVRAM:     usedBytes,
+				FreeVRAM:     freeBytes,
+				UsagePercent: usagePercent,
+			})
+			continue
 		}
 
 		freeBytes := uint64(0)
