@@ -3,6 +3,7 @@ package xsysinfo
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -433,14 +434,139 @@ func getNVIDIAGPUMemory() []GPUMemoryInfo {
 	return gpus
 }
 
-// getAMDGPUMemory queries AMD GPUs using rocm-smi
+// getAMDGPUMemory queries AMD GPUs using amd-smi (primary) or rocm-smi (fallback)
 func getAMDGPUMemory() []GPUMemoryInfo {
-	// Check if rocm-smi is available
+	// Try amd-smi first
+	gpus := getAMDSMIMetrics()
+	if len(gpus) > 0 {
+		return gpus
+	}
+
+	// Fallback to rocm-smi
+	return getRoCMSMIMetrics()
+}
+
+// AMDSMIResponse defines the JSON structure from amd-smi metric command
+type AMDSMIResponse struct {
+	GpuData []AMDSMIGpuData `json:"gpu_data"`
+}
+
+type AMDSMIGpuData struct {
+	Gpu      int            `json:"gpu"`
+	MemUsage AMDSMIMemUsage `json:"mem_usage"`
+}
+
+type AMDSMIMemUsage struct {
+	TotalVram        AMDSMIMemory `json:"total_vram"`
+	UsedVram         AMDSMIMemory `json:"used_vram"`
+	FreeVram         AMDSMIMemory `json:"free_vram"`
+	TotalVisibleVram AMDSMIMemory `json:"total_visible_vram"`
+	UsedVisibleVram  AMDSMIMemory `json:"used_visible_vram"`
+	FreeVisibleVram  AMDSMIMemory `json:"free_visible_vram"`
+	TotalGtt         AMDSMIMemory `json:"total_gtt"`
+	UsedGtt          AMDSMIMemory `json:"used_gtt"`
+	FreeGtt          AMDSMIMemory `json:"free_gtt"`
+}
+
+type AMDSMIMemory struct {
+	Value float64 `json:"value"`
+	Unit  string  `json:"unit"`
+}
+
+func parseAMDSmiMemory(mem AMDSMIMemory) (uint64, error) {
+	if mem.Unit == "MB" {
+		return uint64(mem.Value * 1024 * 1024), nil
+	} else if mem.Unit == "GB" {
+		return uint64(mem.Value * 1024 * 1024 * 1024), nil
+	} else if mem.Unit == "B" {
+		return uint64(mem.Value), nil
+	}
+	return 0, fmt.Errorf("unsupported unit: %s", mem.Unit)
+}
+
+// getAMDSMIMetrics queries AMD GPUs using amd-smi metric command
+func getAMDSMIMetrics() []GPUMemoryInfo {
+	if _, err := exec.LookPath("amd-smi"); err != nil {
+		return nil
+	}
+
+	cmd := exec.Command("amd-smi", "metric", "-m", "--json")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		xlog.Debug("amd-smi failed", "error", err, "stderr", stderr.String())
+		return nil
+	}
+
+	var amdMetricData AMDSMIResponse
+	if err := json.Unmarshal(stdout.Bytes(), &amdMetricData); err != nil {
+		xlog.Debug("failed to parse amd-smi JSON", "error", err)
+		return nil
+	}
+
+	const gttThreshold uint64 = 10 * 1024 * 1024 * 1024
+
+	var gpus []GPUMemoryInfo
+
+	for _, gpuData := range amdMetricData.GpuData {
+		totalVram, _ := parseAMDSmiMemory(gpuData.MemUsage.TotalVram)
+		usedVram, _ := parseAMDSmiMemory(gpuData.MemUsage.UsedVram)
+		freeVram, _ := parseAMDSmiMemory(gpuData.MemUsage.FreeVram)
+
+		totalGtt, _ := parseAMDSmiMemory(gpuData.MemUsage.TotalGtt)
+		usedGtt, _ := parseAMDSmiMemory(gpuData.MemUsage.UsedGtt)
+		freeGtt, _ := parseAMDSmiMemory(gpuData.MemUsage.FreeGtt)
+
+		var totalMemory, usedMemory, freeMemory uint64
+		var deviceName string
+
+		if totalGtt >= gttThreshold && totalGtt > totalVram*2 {
+			totalMemory = totalGtt
+			usedMemory = usedGtt
+			freeMemory = freeGtt
+
+			deviceName = fmt.Sprintf("AMD GPU (GTT: %.2f GB, VRAM: %.2f GB)",
+				float64(totalGtt)/(1024*1024*1024), float64(totalVram)/(1024*1024*1024))
+
+			xlog.Debug("GTT (Unified Memory) detected for AMD GPU",
+				"gpu", gpuData.Gpu,
+				"total_gtt_gb", float64(totalGtt)/(1024*1024*1024),
+				"total_vram_gb", float64(totalVram)/(1024*1024*1024))
+		} else {
+			totalMemory = totalVram
+			usedMemory = usedVram
+			freeMemory = freeVram
+			deviceName = "AMD GPU"
+		}
+
+		usagePercent := 0.0
+		if totalMemory > 0 {
+			usagePercent = float64(usedMemory) / float64(totalMemory) * 100
+		}
+
+		gpus = append(gpus, GPUMemoryInfo{
+			Index:        gpuData.Gpu,
+			Name:         deviceName,
+			Vendor:       VendorAMD,
+			TotalVRAM:    totalMemory,
+			UsedVRAM:     usedMemory,
+			FreeVRAM:     freeMemory,
+			UsagePercent: usagePercent,
+		})
+	}
+
+	return gpus
+}
+
+// getRoCMSMIMetrics queries AMD GPUs using rocm-smi (deprecated fallback)
+func getRoCMSMIMetrics() []GPUMemoryInfo {
 	if _, err := exec.LookPath("rocm-smi"); err != nil {
 		return nil
 	}
 
-	// Try CSV format first
 	cmd := exec.Command("rocm-smi", "--showmeminfo", "vram", "--csv")
 
 	var stdout, stderr bytes.Buffer
@@ -455,7 +581,6 @@ func getAMDGPUMemory() []GPUMemoryInfo {
 	var gpus []GPUMemoryInfo
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 
-	// Skip header line
 	for i, line := range lines {
 		if i == 0 || line == "" {
 			continue
@@ -466,7 +591,6 @@ func getAMDGPUMemory() []GPUMemoryInfo {
 			continue
 		}
 
-		// Parse GPU index from first column (usually "GPU[0]" format)
 		idxStr := strings.TrimSpace(parts[0])
 		idx := 0
 		if strings.HasPrefix(idxStr, "GPU[") {
@@ -475,11 +599,9 @@ func getAMDGPUMemory() []GPUMemoryInfo {
 			idx, _ = strconv.Atoi(idxStr)
 		}
 
-		// Parse memory values (in bytes or MB depending on rocm-smi version)
 		usedBytes, _ := strconv.ParseUint(strings.TrimSpace(parts[2]), 10, 64)
 		totalBytes, _ := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
 
-		// If values seem like MB, convert to bytes
 		if totalBytes < 1000000 {
 			usedBytes *= 1024 * 1024
 			totalBytes *= 1024 * 1024
